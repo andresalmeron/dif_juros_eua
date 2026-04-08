@@ -4,134 +4,116 @@ import numpy as np
 from bcb import sgs
 from fredapi import Fred
 
-# 1. Configurações Iniciais da Página
 st.set_page_config(
     page_title="Dashboard Portfel: Carry Trade & Fator de Hedge", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("📈 Monitor Institucional: Fator de Diferencial Diário (Carry Trade)")
+st.title("📈 Monitor Institucional: Diferencial de Juros (Carry Trade)")
 st.markdown("""
-Esta aplicação calcula o prêmio acumulado pelo diferencial de juros entre Brasil e EUA. 
-A modelagem utiliza fatores diários exatos (CDI em base 252 vs. Fed Funds em base 360), 
-refletindo o padrão de mercado para *backtests* de carteiras globais com *hedge* cambial.
+Esta ferramenta compara as taxas de juros do Brasil e dos EUA para calcular o "prêmio" de investir no Brasil com proteção cambial.
+Os cálculos utilizam o CDI diário e o Fed Funds, convertidos de forma padronizada para mostrar o ganho real do spread.
 """)
 
-# --- FUNÇÃO PARA CONTORNAR O LIMITE DO BCB ---
 @st.cache_data(show_spinner=False)
 def extrair_cdi_fatiado(data_inicio, data_fim):
-    """
-    Fatia a requisição ao BCB em blocos de 5 anos para burlar o limite
-    de 10 anos para séries diárias do SGS. Utiliza a série 12 (CDI).
-    """
     data_atual = pd.to_datetime(data_inicio)
     data_final = pd.to_datetime(data_fim)
     pedacos = []
     
     while data_atual <= data_final:
         proxima_data = min(data_atual + pd.DateOffset(years=5), data_final)
-        # Série 12: Taxa de juros - CDI (anualizada, % a.a.)
-        df_pedaco = sgs.get({'CDI': 12}, start=data_atual, end=proxima_data)
+        # Série 12: Taxa de juros - CDI (% ao dia)
+        df_pedaco = sgs.get({'CDI_Diario_Pct': 12}, start=data_atual, end=proxima_data)
         pedacos.append(df_pedaco)
         data_atual = proxima_data + pd.Timedelta(days=1)
         
     return pd.concat(pedacos)
-# --------------------------------------------------
 
-# 2. Sidebar - Parâmetros do Usuário
 st.sidebar.header("Parâmetros de Extração")
-api_key = st.sidebar.text_input(
-    "Chave API do FRED", 
-    type="password", 
-    help="Insira sua chave gratuita do Federal Reserve"
-)
-
-# Definindo datas padrão
+api_key = st.sidebar.text_input("Chave API do FRED", type="password")
 data_inicio = st.sidebar.date_input("Data de Início", pd.to_datetime("2000-01-01"))
 data_fim = st.sidebar.date_input("Data Final", pd.to_datetime("today"))
 
-# 3. Botão de Execução e Processamento
-if st.sidebar.button("Rodar Simulação de Fatores"):
+if st.sidebar.button("Rodar Simulação"):
     if not api_key:
         st.sidebar.error("A chave da API do FRED é obrigatória.")
     else:
-        with st.spinner("Processando dados do BCB e FRED. Isso leva alguns segundos..."):
+        with st.spinner("Processando e alinhando dados (isso pode levar alguns segundos)..."):
             try:
-                # --- EXTRAÇÃO ---
                 fred = Fred(api_key=api_key)
                 
-                # Extrai o CDI (Brasil) e DFF (EUA)
                 cdi = extrair_cdi_fatiado(data_inicio, data_fim)
                 fed_funds = fred.get_series('DFF', observation_start=data_inicio, observation_end=data_fim)
-                fed_funds = fed_funds.to_frame(name='Fed_Funds')
+                fed_funds = fed_funds.to_frame(name='Fed_Funds_Anual_Pct')
 
-                # --- TRATAMENTO E ALINHAMENTO ---
-                # Junta os dois calendários (feriados do BR e US são diferentes)
                 df = pd.merge(cdi, fed_funds, left_index=True, right_index=True, how='outer')
-                
-                # Preenche feriados e finais de semana com a taxa do dia útil anterior
                 df = df.ffill().dropna() 
 
-                # --- MATEMÁTICA INSTITUCIONAL (FATORAÇÃO) ---
-                # Fator Diário BR (Base 252 - Exponencial)
-                df['Fator_BR'] = (1 + (df['CDI'] / 100)) ** (1/252)
+                # 1. VITRINE PEDAGÓGICA (Taxas Anualizadas para leitura humana)
+                # Transforma o CDI diário em Anual (Base 252)
+                df['CDI_Anualizado_Pct'] = ((1 + (df['CDI_Diario_Pct'] / 100)) ** 252 - 1) * 100
                 
-                # Fator Diário US (Base 360 - Linear)
-                df['Fator_US'] = 1 + ((df['Fed_Funds'] / 100) * (1/360))
+                # O Spread Nominal Anualizado (Apenas para visualização rápida da diferença)
+                df['Spread_Anual_Pct'] = df['CDI_Anualizado_Pct'] - df['Fed_Funds_Anual_Pct']
+
+                # 2. MOTOR MATEMÁTICO (Fatores diários para capitalização exata)
+                # Brasil: A taxa já é diária, basta transformar em fator
+                df['Fator_BR'] = 1 + (df['CDI_Diario_Pct'] / 100)
                 
-                # Diferencial Diário (Carry)
+                # EUA: A taxa é anual, precisamos dividir por 360 para achar o fator diário
+                df['Fator_US'] = 1 + (df['Fed_Funds_Anual_Pct'] / 100 / 360)
+                
+                # O Fator final de Carry (Vento a favor BR / Vento contra US)
                 df['Carry_Diario_Fator'] = df['Fator_BR'] / df['Fator_US']
-                df['Carry_Diario_Pct'] = (df['Carry_Diario_Fator'] - 1) * 100
                 
-                # Acúmulo do Fator (A "Mágica" dos Juros Compostos no Hedge)
-                # O índice base começa em 100 para facilitar a visualização
-                df['Carry_Acumulado (Base 100)'] = 100 * df['Carry_Diario_Fator'].cumprod()
+                # Acúmulo do capital começando em Base 100
+                df['Capital_Acumulado (Base 100)'] = 100 * df['Carry_Diario_Fator'].cumprod()
 
-                # --- VISUALIZAÇÃO NO DASHBOARD ---
+                # --- DASHBOARD VISUAL ---
                 st.markdown("---")
-                st.subheader("Desempenho do Carry Trade (Diferencial Acumulado)")
-                
-                # Gráfico nativo do Streamlit da curva de capitalização
-                st.line_chart(df['Carry_Acumulado (Base 100)'])
+                st.subheader("O Poder do Carry Trade Acumulado")
+                st.line_chart(df['Capital_Acumulado (Base 100)'])
 
-                # Métricas principais
-                st.markdown("### Resumo do Período")
+                st.markdown("### Resumo do Período (Médias Anualizadas)")
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Média CDI", f"{df['CDI'].mean():.2f}% a.a.")
-                col2.metric("Média Fed Funds", f"{df['Fed_Funds'].mean():.2f}% a.a.")
+                col1.metric("CDI (Média Anual)", f"{df['CDI_Anualizado_Pct'].mean():.2f}% a.a.")
+                col2.metric("Fed Funds (Média Anual)", f"{df['Fed_Funds_Anual_Pct'].mean():.2f}% a.a.")
                 
-                # Retorno total acumulado do spread (Opcional: Subtrai os 100 iniciais para ver só o ganho percentual)
-                retorno_total_pct = df['Carry_Acumulado (Base 100)'].iloc[-1] - 100
-                col3.metric("Retorno Acumulado do Hedge", f"{retorno_total_pct:.2f}%")
+                retorno_total_pct = df['Capital_Acumulado (Base 100)'].iloc[-1] - 100
+                col3.metric("Ganho Total do Hedge", f"{retorno_total_pct:.2f}%")
                 
-                # Anualização do retorno total (CAGR)
                 anos_passados = len(df) / 252
-                cagr = ((df['Carry_Acumulado (Base 100)'].iloc[-1] / 100) ** (1 / anos_passados) - 1) * 100
-                col4.metric("Carry Médio Anualizado (CAGR)", f"{cagr:.2f}% a.a.")
+                cagr = ((df['Capital_Acumulado (Base 100)'].iloc[-1] / 100) ** (1 / anos_passados) - 1) * 100
+                col4.metric("Ganho Médio Anualizado", f"{cagr:.2f}% a.a.")
 
-                # --- TABELA E EXPORTAÇÃO ---
+                # --- TABELA DE DADOS ---
                 st.markdown("---")
-                st.subheader("Base de Dados Fatorada")
+                st.subheader("Base de Dados (Visão Simplificada)")
+                st.markdown("A tabela exibe as taxas anualizadas para facilitar a leitura. Os cálculos usaram as frações diárias corretas.")
                 
-                # Mostra colunas formatadas para melhor leitura na tela
-                colunas_display = ['CDI', 'Fed_Funds', 'Fator_BR', 'Fator_US', 'Carry_Diario_Pct', 'Carry_Acumulado (Base 100)']
+                colunas_display = [
+                    'CDI_Anualizado_Pct', 
+                    'Fed_Funds_Anual_Pct', 
+                    'Spread_Anual_Pct', 
+                    'Carry_Diario_Fator', 
+                    'Capital_Acumulado (Base 100)'
+                ]
+                
                 st.dataframe(df[colunas_display].style.format({
-                    'CDI': '{:.2f}',
-                    'Fed_Funds': '{:.2f}',
-                    'Fator_BR': '{:.6f}',
-                    'Fator_US': '{:.6f}',
-                    'Carry_Diario_Pct': '{:.4f}',
-                    'Carry_Acumulado (Base 100)': '{:.2f}'
+                    'CDI_Anualizado_Pct': '{:.2f}%',
+                    'Fed_Funds_Anual_Pct': '{:.2f}%',
+                    'Spread_Anual_Pct': '{:.2f} p.p.',
+                    'Carry_Diario_Fator': '{:.6f}',
+                    'Capital_Acumulado (Base 100)': '{:.2f}'
                 }))
 
-                # Exportar para CSV
                 csv = df.to_csv(index=True, sep=';', decimal=',')
-                
                 st.download_button(
-                    label="📥 Fazer Download da Planilha (CSV PT-BR)",
+                    label="📥 Download Planilha (CSV)",
                     data=csv,
-                    file_name='portfel_hedge_fatorado.csv',
+                    file_name='portfel_carry_trade_ajustado.csv',
                     mime='text/csv',
                 )
 
